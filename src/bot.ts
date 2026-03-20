@@ -144,11 +144,6 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    pendingSessionPicks.set(
-      chatId,
-      allSessions.map((session) => ({ path: session.path, cwd: session.cwd })),
-    );
-
     const grouped = new Map<string, Array<(typeof allSessions)[number]>>();
     for (const session of allSessions) {
       const workspace = session.cwd || "Unknown";
@@ -160,7 +155,8 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
 
     const keyboard = new InlineKeyboard();
     const textLines: string[] = [];
-    let globalIndex = 0;
+    // Build the pick list in display order (grouped by workspace) so indices match buttons
+    const orderedPicks: Array<{ path: string; cwd: string }> = [];
 
     for (const [workspace, sessions] of grouped) {
       const shortWorkspace = getWorkspaceShortName(workspace);
@@ -170,13 +166,16 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       textLines.push(`📁 ${shortWorkspace}`);
 
       for (const session of sessions) {
-        const label = trimLine(session.name || session.firstMessage, 35) || `Session ${globalIndex + 1}`;
+        const idx = orderedPicks.length;
+        const label = trimLine(session.name || session.firstMessage, 35) || `Session ${idx + 1}`;
         const buttonLabel = `📁 ${shortWorkspace.slice(0, 8)} · ${label.slice(0, 30)}`;
-        keyboard.text(buttonLabel, `switch_${globalIndex}`).row();
-        textLines.push(`  ${globalIndex + 1}. ${label} (${session.messageCount} msgs)`);
-        globalIndex += 1;
+        keyboard.text(buttonLabel, `switch_${idx}`).row();
+        textLines.push(`  ${idx + 1}. ${label} (${session.messageCount} msgs)`);
+        orderedPicks.push({ path: session.path, cwd: session.cwd });
       }
     }
+
+    pendingSessionPicks.set(chatId, orderedPicks);
 
     const plainText = [
       `Available sessions (${allSessions.length} shown):`,
