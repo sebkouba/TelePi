@@ -1,3 +1,8 @@
+import { randomUUID } from "node:crypto";
+import { unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { InlineKeyboard, Bot, type Context } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 
@@ -11,6 +16,7 @@ import {
   truncateText,
   type TreeFilterMode,
 } from "./tree.js";
+import { getAvailableBackends, transcribeAudio } from "./voice.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
@@ -51,6 +57,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
 
   let isProcessing = false;
   let isSwitching = false;
+  let isTranscribing = false;
   const pendingSessionPicks = new Map<number, Array<{ path: string; cwd: string }>>();
   const pendingWorkspacePicks = new Map<number, string[]>();
   const pendingModelPicks = new Map<number, Array<{ provider: string; id: string }>>();
@@ -88,12 +95,411 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
     return labels;
   };
 
+  const isBusy = (): boolean => isProcessing || isSwitching || isTranscribing || piSession.isStreaming();
+
+  const sendBusyReply = async (ctx: Context): Promise<void> => {
+    await safeReply(ctx, escapeHTML("Still working on previous message..."), {
+      fallbackText: "Still working on previous message...",
+    });
+  };
+
+  const ensureActiveSession = async (ctx: Context): Promise<boolean> => {
+    if (piSession.hasActiveSession()) {
+      return true;
+    }
+
+    try {
+      await piSession.newSession();
+      return true;
+    } catch (error) {
+      await safeReply(ctx, escapeHTML(`Failed to create session: ${formatError(error)}`), {
+        fallbackText: `Failed to create session: ${formatError(error)}`,
+      });
+      return false;
+    }
+  };
+
+  const handleUserPrompt = async (ctx: Context, chatId: number, userText: string): Promise<void> => {
+    if (isBusy()) {
+      await sendBusyReply(ctx);
+      return;
+    }
+
+    isProcessing = true;
+
+    try {
+      if (!(await ensureActiveSession(ctx))) {
+        return;
+      }
+
+      const abortKeyboard = new InlineKeyboard().text("⏹ Abort", "pi_abort");
+      const toolVerbosity: ToolVerbosity = config.toolVerbosity;
+      const toolStates = new Map<string, ToolState>();
+      const toolCounts = new Map<string, number>();
+      let accumulatedText = "";
+      let responseMessageId: number | undefined;
+      let responseMessagePromise: Promise<void> | undefined;
+      let lastRenderedText = "";
+      let lastEditAt = 0;
+      let flushTimer: NodeJS.Timeout | undefined;
+      let isFlushing = false;
+      let flushPending = false;
+      let finalized = false;
+
+      const typingInterval = setInterval(() => {
+        void bot.api.sendChatAction(chatId, "typing").catch(() => {});
+      }, TYPING_INTERVAL_MS);
+      void bot.api.sendChatAction(chatId, "typing").catch(() => {});
+
+      const stopTyping = (): void => {
+        clearInterval(typingInterval);
+      };
+
+      const clearFlushTimer = (): void => {
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flushTimer = undefined;
+        }
+      };
+
+      const renderPreview = (): RenderedChunk => {
+        const previewText = buildStreamingPreview(accumulatedText);
+        return renderMarkdownChunkWithinLimit(previewText);
+      };
+
+      const buildFinalResponseText = (text: string): string => {
+        if (toolVerbosity !== "summary") {
+          return text.trim();
+        }
+
+        const summaryLine = formatToolSummaryLine(toolCounts);
+        const trimmedText = text.trim();
+        if (!summaryLine) {
+          return trimmedText;
+        }
+
+        return trimmedText ? `${trimmedText}\n\n${summaryLine}` : summaryLine;
+      };
+
+      const ensureResponseMessage = async (): Promise<void> => {
+        if (responseMessageId) {
+          return;
+        }
+        if (responseMessagePromise) {
+          await responseMessagePromise;
+          return;
+        }
+
+        responseMessagePromise = (async () => {
+          stopTyping();
+          const preview = renderPreview();
+          const message = await sendTextMessage(bot.api, chatId, preview.text, {
+            parseMode: preview.parseMode,
+            fallbackText: preview.fallbackText,
+            replyMarkup: abortKeyboard,
+          });
+          responseMessageId = message.message_id;
+          lastRenderedText = preview.text;
+          lastEditAt = Date.now();
+        })();
+
+        try {
+          await responseMessagePromise;
+        } finally {
+          responseMessagePromise = undefined;
+        }
+      };
+
+      const flushResponse = async (force = false): Promise<void> => {
+        if (!accumulatedText) {
+          return;
+        }
+        if (!responseMessageId) {
+          await ensureResponseMessage();
+          return;
+        }
+        if (isFlushing) {
+          flushPending = true;
+          return;
+        }
+
+        const now = Date.now();
+        if (!force && now - lastEditAt < EDIT_DEBOUNCE_MS) {
+          return;
+        }
+
+        const nextText = renderPreview();
+        if (nextText.text === lastRenderedText) {
+          return;
+        }
+
+        isFlushing = true;
+        try {
+          await safeEditMessage(bot, chatId, responseMessageId, nextText.text, {
+            parseMode: nextText.parseMode,
+            fallbackText: nextText.fallbackText,
+            replyMarkup: abortKeyboard,
+          });
+          lastRenderedText = nextText.text;
+          lastEditAt = Date.now();
+        } finally {
+          isFlushing = false;
+          if (flushPending) {
+            flushPending = false;
+            scheduleFlush();
+          }
+        }
+      };
+
+      const scheduleFlush = (): void => {
+        if (flushTimer || finalized) {
+          return;
+        }
+
+        const delay = Math.max(0, EDIT_DEBOUNCE_MS - (Date.now() - lastEditAt));
+        flushTimer = setTimeout(() => {
+          flushTimer = undefined;
+          void flushResponse().catch((error) => {
+            console.error("Failed to update Telegram response message", error);
+          });
+        }, delay);
+      };
+
+      const removeAbortKeyboard = async (): Promise<void> => {
+        if (!responseMessageId) {
+          return;
+        }
+
+        try {
+          await bot.api.editMessageReplyMarkup(chatId, responseMessageId, {
+            reply_markup: new InlineKeyboard(),
+          });
+        } catch (error) {
+          if (!isMessageNotModifiedError(error)) {
+            console.error("Failed to clear Abort button", error);
+          }
+        }
+      };
+
+      const deliverRenderedChunks = async (chunks: RenderedChunk[]): Promise<void> => {
+        if (chunks.length === 0) {
+          return;
+        }
+
+        const [firstChunk, ...remainingChunks] = chunks;
+        if (responseMessageId) {
+          await safeEditMessage(bot, chatId, responseMessageId, firstChunk.text, {
+            parseMode: firstChunk.parseMode,
+            fallbackText: firstChunk.fallbackText,
+          });
+          await removeAbortKeyboard();
+        } else {
+          const message = await sendTextMessage(bot.api, chatId, firstChunk.text, {
+            parseMode: firstChunk.parseMode,
+            fallbackText: firstChunk.fallbackText,
+          });
+          responseMessageId = message.message_id;
+        }
+
+        for (const chunk of remainingChunks) {
+          await sendTextMessage(bot.api, chatId, chunk.text, {
+            parseMode: chunk.parseMode,
+            fallbackText: chunk.fallbackText,
+          });
+        }
+      };
+
+      const finalizeResponse = async (): Promise<void> => {
+        if (finalized) {
+          return;
+        }
+        finalized = true;
+
+        stopTyping();
+        clearFlushTimer();
+        if (responseMessagePromise) {
+          try {
+            await responseMessagePromise;
+          } catch {
+            // If the initial send failed, we will fall back to sending the final response below.
+          }
+        }
+
+        const finalText = buildFinalResponseText(accumulatedText);
+        if (!finalText) {
+          const html = "<b>✅ Done</b>";
+          const plainText = "✅ Done";
+
+          if (responseMessageId) {
+            await safeEditMessage(bot, chatId, responseMessageId, html, { fallbackText: plainText });
+            await removeAbortKeyboard();
+          } else {
+            await safeReply(ctx, html, { fallbackText: plainText });
+          }
+          return;
+        }
+
+        await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
+      };
+
+      const unsubscribe = piSession.subscribe({
+        onTextDelta: (delta) => {
+          accumulatedText += delta;
+          if (!responseMessageId) {
+            void ensureResponseMessage()
+              .then(() => {
+                scheduleFlush();
+              })
+              .catch((error) => {
+                console.error("Failed to send initial Telegram response message", error);
+              });
+            return;
+          }
+
+          scheduleFlush();
+        },
+        onToolStart: (toolName, toolCallId) => {
+          if (toolVerbosity === "summary") {
+            toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
+            return;
+          }
+
+          if (toolVerbosity === "none") {
+            return;
+          }
+
+          toolStates.set(toolCallId, { toolName, partialResult: "" });
+          if (toolVerbosity !== "all") {
+            return;
+          }
+
+          const messageText = renderToolStartMessage(toolName);
+
+          void (async () => {
+            const message = await sendTextMessage(bot.api, chatId, messageText.text, {
+              parseMode: messageText.parseMode,
+              fallbackText: messageText.fallbackText,
+            });
+            const state = toolStates.get(toolCallId);
+            if (!state) {
+              return;
+            }
+
+            state.messageId = message.message_id;
+            if (state.finalStatus) {
+              await safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
+                parseMode: state.finalStatus.parseMode,
+                fallbackText: state.finalStatus.fallbackText,
+              });
+            }
+          })().catch((error) => {
+            console.error(`Failed to send tool start message for ${toolName}`, error);
+          });
+        },
+        onToolUpdate: (toolCallId, partialResult) => {
+          if (toolVerbosity === "none" || toolVerbosity === "summary") {
+            return;
+          }
+
+          const state = toolStates.get(toolCallId);
+          if (!state || !partialResult) {
+            return;
+          }
+
+          state.partialResult = appendWithCap(state.partialResult, partialResult, TOOL_OUTPUT_PREVIEW_LIMIT);
+        },
+        onToolEnd: (toolCallId, isError) => {
+          if (toolVerbosity === "none" || toolVerbosity === "summary") {
+            return;
+          }
+
+          const state = toolStates.get(toolCallId);
+          if (!state) {
+            return;
+          }
+
+          state.finalStatus = renderToolEndMessage(state.toolName, state.partialResult, isError);
+          if (toolVerbosity === "errors-only") {
+            if (!isError) {
+              return;
+            }
+
+            // errors-only: no start message was sent, so always send a new message (not edit)
+            void sendTextMessage(bot.api, chatId, state.finalStatus.text, {
+              parseMode: state.finalStatus.parseMode,
+              fallbackText: state.finalStatus.fallbackText,
+            }).catch((error) => {
+              console.error(`Failed to send tool error message for ${state.toolName}`, error);
+            });
+            return;
+          }
+
+          if (!state.messageId) {
+            return;
+          }
+
+          void safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
+            parseMode: state.finalStatus.parseMode,
+            fallbackText: state.finalStatus.fallbackText,
+          }).catch((error) => {
+            console.error(`Failed to update tool message for ${state.toolName}`, error);
+          });
+        },
+        onAgentEnd: () => {
+          void finalizeResponse().catch((error) => {
+            console.error("Failed to finalize Telegram response message", error);
+          });
+        },
+      });
+
+      try {
+        await piSession.prompt(userText);
+        await finalizeResponse();
+      } catch (error) {
+        stopTyping();
+        clearFlushTimer();
+        if (responseMessagePromise) {
+          try {
+            await responseMessagePromise;
+          } catch {
+            // Ignore; we will send an error message below.
+          }
+        }
+
+        if (finalized) {
+          console.error("Pi prompt error after finalization:", formatError(error));
+        } else {
+          finalized = true;
+
+          const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
+          const chunks = splitMarkdownForTelegram(combinedText);
+          try {
+            await deliverRenderedChunks(chunks);
+          } catch (telegramError) {
+            console.error("Failed to send error message to Telegram:", telegramError);
+          }
+        }
+      } finally {
+        stopTyping();
+        clearFlushTimer();
+        unsubscribe();
+      }
+    } finally {
+      isProcessing = false;
+    }
+  };
+
   bot.command("start", async (ctx) => {
     const info = piSession.getInfo();
+    const voiceBackends = await getAvailableBackends().catch(() => []);
+    const voiceInfoPlain = renderVoiceSupportPlain(voiceBackends);
+    const voiceInfoHTML = renderVoiceSupportHTML(voiceBackends);
     const plainText = [
       "TelePi is ready.",
       "",
       "Send any text message to continue the current Pi session from Telegram.",
+      "Send a voice message or audio file to transcribe it into a Pi prompt.",
+      voiceInfoPlain,
       "",
       renderSessionInfoPlain(info),
     ].join("\n");
@@ -101,6 +507,8 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       "<b>TelePi is ready.</b>",
       "",
       "Send any text message to continue the current Pi session from Telegram.",
+      "Send a voice message or audio file to transcribe it into a Pi prompt.",
+      voiceInfoHTML,
       "",
       renderSessionInfoHTML(info),
     ].join("\n");
@@ -134,7 +542,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await safeReply(ctx, escapeHTML("Cannot switch sessions while a prompt is running."), {
         fallbackText: "Cannot switch sessions while a prompt is running.",
       });
@@ -232,7 +640,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await safeReply(ctx, escapeHTML("Cannot create new session while a prompt is running."), {
         fallbackText: "Cannot create new session while a prompt is running.",
       });
@@ -279,7 +687,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
   });
 
   bot.command("handback", async (ctx) => {
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await safeReply(ctx, escapeHTML("Cannot hand back while a prompt is running. Use /abort first."), {
         fallbackText: "Cannot hand back while a prompt is running. Use /abort first.",
       });
@@ -417,7 +825,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await safeReply(ctx, escapeHTML("Cannot view tree while a prompt is running."), {
         fallbackText: "Cannot view tree while a prompt is running.",
       });
@@ -466,7 +874,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await safeReply(ctx, escapeHTML("Cannot navigate while a prompt is running."), {
         fallbackText: "Cannot navigate while a prompt is running.",
       });
@@ -525,7 +933,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await safeReply(ctx, escapeHTML("Cannot label entries while a prompt is running."), {
         fallbackText: "Cannot label entries while a prompt is running.",
       });
@@ -620,7 +1028,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -668,7 +1076,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -724,7 +1132,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -768,7 +1176,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -821,7 +1229,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -883,7 +1291,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -959,7 +1367,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
+    if (isBusy()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -992,380 +1400,61 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || isSwitching || piSession.isStreaming()) {
-      await safeReply(ctx, escapeHTML("Still working on previous message..."), {
-        fallbackText: "Still working on previous message...",
-      });
+    await handleUserPrompt(ctx, ctx.chat.id, userText);
+  });
+
+  bot.on(["message:voice", "message:audio"], async (ctx) => {
+    const chatId = ctx.chat.id;
+    if (isBusy()) {
+      await sendBusyReply(ctx);
       return;
     }
 
-    if (!piSession.hasActiveSession()) {
-      try {
-        await piSession.newSession();
-      } catch (error) {
-        await safeReply(ctx, escapeHTML(`Failed to create session: ${formatError(error)}`), {
-          fallbackText: `Failed to create session: ${formatError(error)}`,
-        });
-        return;
-      }
+    const fileId = ctx.message.voice?.file_id ?? ctx.message.audio?.file_id;
+    if (!fileId) {
+      return;
     }
 
-    isProcessing = true;
-
-    const chatId = ctx.chat.id;
-    const abortKeyboard = new InlineKeyboard().text("⏹ Abort", "pi_abort");
-    const toolVerbosity: ToolVerbosity = config.toolVerbosity;
-    const toolStates = new Map<string, ToolState>();
-    const toolCounts = new Map<string, number>();
-    let accumulatedText = "";
-    let responseMessageId: number | undefined;
-    let responseMessagePromise: Promise<void> | undefined;
-    let lastRenderedText = "";
-    let lastEditAt = 0;
-    let flushTimer: NodeJS.Timeout | undefined;
-    let isFlushing = false;
-    let flushPending = false;
-    let finalized = false;
-
-    const typingInterval = setInterval(() => {
-      void bot.api.sendChatAction(chatId, "typing").catch(() => {});
-    }, TYPING_INTERVAL_MS);
-    void bot.api.sendChatAction(chatId, "typing").catch(() => {});
-
-    const stopTyping = (): void => {
-      clearInterval(typingInterval);
-    };
-
-    const clearFlushTimer = (): void => {
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = undefined;
-      }
-    };
-
-    const renderPreview = (): RenderedChunk => {
-      const previewText = buildStreamingPreview(accumulatedText);
-      return renderMarkdownChunkWithinLimit(previewText);
-    };
-
-    const buildFinalResponseText = (text: string): string => {
-      if (toolVerbosity !== "summary") {
-        return text.trim();
-      }
-
-      const summaryLine = formatToolSummaryLine(toolCounts);
-      const trimmedText = text.trim();
-      if (!summaryLine) {
-        return trimmedText;
-      }
-
-      return trimmedText ? `${trimmedText}\n\n${summaryLine}` : summaryLine;
-    };
-
-    const ensureResponseMessage = async (): Promise<void> => {
-      if (responseMessageId) {
-        return;
-      }
-      if (responseMessagePromise) {
-        await responseMessagePromise;
-        return;
-      }
-
-      responseMessagePromise = (async () => {
-        stopTyping();
-        const preview = renderPreview();
-        const message = await sendTextMessage(bot.api, chatId, preview.text, {
-          parseMode: preview.parseMode,
-          fallbackText: preview.fallbackText,
-          replyMarkup: abortKeyboard,
-        });
-        responseMessageId = message.message_id;
-        lastRenderedText = preview.text;
-        lastEditAt = Date.now();
-      })();
-
-      try {
-        await responseMessagePromise;
-      } finally {
-        responseMessagePromise = undefined;
-      }
-    };
-
-    const flushResponse = async (force = false): Promise<void> => {
-      if (!accumulatedText) {
-        return;
-      }
-      if (!responseMessageId) {
-        await ensureResponseMessage();
-        return;
-      }
-      if (isFlushing) {
-        flushPending = true;
-        return;
-      }
-
-      const now = Date.now();
-      if (!force && now - lastEditAt < EDIT_DEBOUNCE_MS) {
-        return;
-      }
-
-      const nextText = renderPreview();
-      if (nextText.text === lastRenderedText) {
-        return;
-      }
-
-      isFlushing = true;
-      try {
-        await safeEditMessage(bot, chatId, responseMessageId, nextText.text, {
-          parseMode: nextText.parseMode,
-          fallbackText: nextText.fallbackText,
-          replyMarkup: abortKeyboard,
-        });
-        lastRenderedText = nextText.text;
-        lastEditAt = Date.now();
-      } finally {
-        isFlushing = false;
-        if (flushPending) {
-          flushPending = false;
-          scheduleFlush();
-        }
-      }
-    };
-
-    const scheduleFlush = (): void => {
-      if (flushTimer || finalized) {
-        return;
-      }
-
-      const delay = Math.max(0, EDIT_DEBOUNCE_MS - (Date.now() - lastEditAt));
-      flushTimer = setTimeout(() => {
-        flushTimer = undefined;
-        void flushResponse().catch((error) => {
-          console.error("Failed to update Telegram response message", error);
-        });
-      }, delay);
-    };
-
-    const removeAbortKeyboard = async (): Promise<void> => {
-      if (!responseMessageId) {
-        return;
-      }
-
-      try {
-        await bot.api.editMessageReplyMarkup(chatId, responseMessageId, {
-          reply_markup: new InlineKeyboard(),
-        });
-      } catch (error) {
-        if (!isMessageNotModifiedError(error)) {
-          console.error("Failed to clear Abort button", error);
-        }
-      }
-    };
-
-    const deliverRenderedChunks = async (chunks: RenderedChunk[]): Promise<void> => {
-      if (chunks.length === 0) {
-        return;
-      }
-
-      const [firstChunk, ...remainingChunks] = chunks;
-      if (responseMessageId) {
-        await safeEditMessage(bot, chatId, responseMessageId, firstChunk.text, {
-          parseMode: firstChunk.parseMode,
-          fallbackText: firstChunk.fallbackText,
-        });
-        await removeAbortKeyboard();
-      } else {
-        const message = await sendTextMessage(bot.api, chatId, firstChunk.text, {
-          parseMode: firstChunk.parseMode,
-          fallbackText: firstChunk.fallbackText,
-        });
-        responseMessageId = message.message_id;
-      }
-
-      for (const chunk of remainingChunks) {
-        await sendTextMessage(bot.api, chatId, chunk.text, {
-          parseMode: chunk.parseMode,
-          fallbackText: chunk.fallbackText,
-        });
-      }
-    };
-
-    const finalizeResponse = async (): Promise<void> => {
-      if (finalized) {
-        return;
-      }
-      finalized = true;
-
-      stopTyping();
-      clearFlushTimer();
-      if (responseMessagePromise) {
-        try {
-          await responseMessagePromise;
-        } catch {
-          // If the initial send failed, we will fall back to sending the final response below.
-        }
-      }
-
-      const finalText = buildFinalResponseText(accumulatedText);
-      if (!finalText) {
-        const html = "<b>✅ Done</b>";
-        const plainText = "✅ Done";
-
-        if (responseMessageId) {
-          await safeEditMessage(bot, chatId, responseMessageId, html, { fallbackText: plainText });
-          await removeAbortKeyboard();
-        } else {
-          await safeReply(ctx, html, { fallbackText: plainText });
-        }
-        return;
-      }
-
-      await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
-    };
-
-    const unsubscribe = piSession.subscribe({
-      onTextDelta: (delta) => {
-        accumulatedText += delta;
-        if (!responseMessageId) {
-          void ensureResponseMessage()
-            .then(() => {
-              scheduleFlush();
-            })
-            .catch((error) => {
-              console.error("Failed to send initial Telegram response message", error);
-            });
-          return;
-        }
-
-        scheduleFlush();
-      },
-      onToolStart: (toolName, toolCallId) => {
-        if (toolVerbosity === "summary") {
-          toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
-          return;
-        }
-
-        if (toolVerbosity === "none") {
-          return;
-        }
-
-        toolStates.set(toolCallId, { toolName, partialResult: "" });
-        if (toolVerbosity !== "all") {
-          return;
-        }
-
-        const messageText = renderToolStartMessage(toolName);
-
-        void (async () => {
-          const message = await sendTextMessage(bot.api, chatId, messageText.text, {
-            parseMode: messageText.parseMode,
-            fallbackText: messageText.fallbackText,
-          });
-          const state = toolStates.get(toolCallId);
-          if (!state) {
-            return;
-          }
-
-          state.messageId = message.message_id;
-          if (state.finalStatus) {
-            await safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
-              parseMode: state.finalStatus.parseMode,
-              fallbackText: state.finalStatus.fallbackText,
-            });
-          }
-        })().catch((error) => {
-          console.error(`Failed to send tool start message for ${toolName}`, error);
-        });
-      },
-      onToolUpdate: (toolCallId, partialResult) => {
-        if (toolVerbosity === "none" || toolVerbosity === "summary") {
-          return;
-        }
-
-        const state = toolStates.get(toolCallId);
-        if (!state || !partialResult) {
-          return;
-        }
-
-        state.partialResult = appendWithCap(state.partialResult, partialResult, TOOL_OUTPUT_PREVIEW_LIMIT);
-      },
-      onToolEnd: (toolCallId, isError) => {
-        if (toolVerbosity === "none" || toolVerbosity === "summary") {
-          return;
-        }
-
-        const state = toolStates.get(toolCallId);
-        if (!state) {
-          return;
-        }
-
-        state.finalStatus = renderToolEndMessage(state.toolName, state.partialResult, isError);
-        if (toolVerbosity === "errors-only") {
-          if (!isError) {
-            return;
-          }
-
-          // errors-only: no start message was sent, so always send a new message (not edit)
-          void sendTextMessage(bot.api, chatId, state.finalStatus.text, {
-            parseMode: state.finalStatus.parseMode,
-            fallbackText: state.finalStatus.fallbackText,
-          }).catch((error) => {
-            console.error(`Failed to send tool error message for ${state.toolName}`, error);
-          });
-          return;
-        }
-
-        if (!state.messageId) {
-          return;
-        }
-
-        void safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
-          parseMode: state.finalStatus.parseMode,
-          fallbackText: state.finalStatus.fallbackText,
-        }).catch((error) => {
-          console.error(`Failed to update tool message for ${state.toolName}`, error);
-        });
-      },
-      onAgentEnd: () => {
-        void finalizeResponse().catch((error) => {
-          console.error("Failed to finalize Telegram response message", error);
-        });
-      },
-    });
+    isTranscribing = true;
+    let tempFilePath: string | undefined;
+    let transcript: string | undefined;
 
     try {
-      await piSession.prompt(userText);
-      await finalizeResponse();
+      await ctx.api.sendChatAction(chatId, "typing");
+      tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, fileId);
+
+      const result = await transcribeAudio(tempFilePath);
+      transcript = result.text.trim();
+      if (!transcript) {
+        await safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
+          fallbackText: "Transcription was empty. Please try again or send text instead.",
+        });
+        return;
+      }
+
+      const preview = truncateText(transcript.replace(/\s+/g, " "), 240);
+      await safeReply(
+        ctx,
+        `🎤 ${escapeHTML(preview)} <i>(via ${escapeHTML(result.backend)})</i>`,
+        { fallbackText: `🎤 ${preview} (via ${result.backend})` },
+      );
     } catch (error) {
-      stopTyping();
-      clearFlushTimer();
-      if (responseMessagePromise) {
-        try {
-          await responseMessagePromise;
-        } catch {
-          // Ignore; we will send an error message below.
-        }
-      }
-
-      if (finalized) {
-        console.error("Pi prompt error after finalization:", formatError(error));
-      } else {
-        finalized = true;
-
-        const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
-        const chunks = splitMarkdownForTelegram(combinedText);
-        try {
-          await deliverRenderedChunks(chunks);
-        } catch (telegramError) {
-          console.error("Failed to send error message to Telegram:", telegramError);
-        }
-      }
+      await safeReply(ctx, `<b>Transcription failed:</b>\n${escapeHTML(formatError(error))}`, {
+        fallbackText: `Transcription failed:\n${formatError(error)}`,
+      });
+      return;
     } finally {
-      stopTyping();
-      clearFlushTimer();
-      unsubscribe();
-      isProcessing = false;
+      isTranscribing = false;
+      if (tempFilePath) {
+        await unlink(tempFilePath).catch(() => {});
+      }
     }
+
+    if (!transcript) {
+      return;
+    }
+
+    await handleUserPrompt(ctx, chatId, transcript);
   });
 
   bot.catch((error) => {
@@ -1417,6 +1506,22 @@ function renderSessionInfoHTML(info: PiSessionInfo): string {
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
+}
+
+function renderVoiceSupportPlain(backends: string[]): string {
+  if (backends.length === 0) {
+    return "Voice transcription: unavailable (install parakeet-node or set OPENAI_API_KEY).";
+  }
+
+  return `Voice transcription: ${backends.join(", ")}.`;
+}
+
+function renderVoiceSupportHTML(backends: string[]): string {
+  if (backends.length === 0) {
+    return "<i>Voice transcription unavailable.</i> Install <code>parakeet-node</code> or set <code>OPENAI_API_KEY</code>.";
+  }
+
+  return `<i>Voice transcription available via:</i> <code>${escapeHTML(backends.join(", "))}</code>`;
 }
 
 function renderToolStartMessage(toolName: string): RenderedText {
@@ -1538,6 +1643,32 @@ async function safeEditMessage(
 
     throw error;
   }
+}
+
+const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024; // 25 MB
+
+async function downloadTelegramFile(api: Context["api"], token: string, fileId: string): Promise<string> {
+  const file = await api.getFile(fileId);
+  if (!file.file_path) {
+    throw new Error("Telegram did not return a file path");
+  }
+
+  if (file.file_size && file.file_size > MAX_AUDIO_FILE_SIZE) {
+    throw new Error(`Audio file too large (${Math.round(file.file_size / 1024 / 1024)} MB, max 25 MB)`);
+  }
+
+  // URL contains the bot token — do not log this variable
+  const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download voice file: ${response.status}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const extension = path.extname(file.file_path) || ".ogg";
+  const tempPath = path.join(tmpdir(), `telepi-voice-${randomUUID()}${extension}`);
+  await writeFile(tempPath, buffer);
+  return tempPath;
 }
 
 function splitTelegramText(text: string): string[] {

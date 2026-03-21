@@ -1,8 +1,5 @@
+import { unlink, writeFile } from "node:fs/promises";
 import { vi } from "vitest";
-
-import type { TelePiConfig } from "../src/config.js";
-import type { PiSessionCallbacks, PiSessionInfo, PiSessionService } from "../src/pi-session.js";
-import { createBot, registerCommands } from "../src/bot.js";
 
 vi.mock("@grammyjs/auto-retry", () => ({
   autoRetry: () => (prev: any, method: string, payload: any, signal: any) =>
@@ -12,6 +9,31 @@ vi.mock("@grammyjs/auto-retry", () => ({
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn().mockReturnValue({ status: 0 }),
 }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    writeFile: vi.fn().mockResolvedValue(undefined),
+    unlink: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
+vi.mock("../src/voice.js", () => ({
+  transcribeAudio: vi.fn().mockResolvedValue({
+    text: "transcribed text",
+    backend: "openai",
+    durationMs: 500,
+  }),
+  getAvailableBackends: vi.fn().mockResolvedValue(["openai"]),
+  _setImportHook: vi.fn(),
+  _resetImportHook: vi.fn(),
+}));
+
+import type { TelePiConfig } from "../src/config.js";
+import type { PiSessionCallbacks, PiSessionInfo, PiSessionService } from "../src/pi-session.js";
+import { createBot, registerCommands } from "../src/bot.js";
+import { getAvailableBackends, transcribeAudio } from "../src/voice.js";
 
 const ALLOWED_USER_ID = 123;
 const ALLOWED_CHAT_ID = 456;
@@ -224,6 +246,10 @@ function setupBot(options: SetupOptions = {}) {
     sendChatAction: vi.fn().mockResolvedValue(true),
     setMyCommands: vi.fn().mockResolvedValue(true),
     answerCallbackQuery: vi.fn().mockResolvedValue(true),
+    getFile: vi.fn().mockImplementation(async (fileId: string) => ({
+      file_id: fileId,
+      file_path: "voice/file.ogg",
+    })),
   };
 
   bot.api.config.use(async (_prev, method, payload) => {
@@ -258,6 +284,11 @@ function setupBot(options: SetupOptions = {}) {
           text: payload.text,
         });
         return { ok: true, result: true };
+      case "getFile":
+        return {
+          ok: true,
+          result: await api.getFile(payload.file_id),
+        };
       default:
         throw new Error(`Unexpected Telegram API method in test: ${method}`);
     }
@@ -300,6 +331,26 @@ function createTestUpdate(overrides: Record<string, any> = {}): any {
   return update;
 }
 
+function createVoiceUpdate(overrides: Record<string, any> = {}): any {
+  const { message: messageOverrides = {}, ...updateOverrides } = overrides;
+  return {
+    update_id: Math.floor(Math.random() * 1_000_000),
+    ...updateOverrides,
+    message: {
+      message_id: 1,
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: ALLOWED_CHAT_ID, type: "private" },
+      from: { id: ALLOWED_USER_ID, is_bot: false, first_name: "Test" },
+      voice: {
+        file_id: "voice-file-id",
+        file_unique_id: "voice-unique",
+        duration: 5,
+      },
+      ...messageOverrides,
+    },
+  };
+}
+
 function createCallbackUpdate(data: string, overrides: Record<string, any> = {}): any {
   const { callback_query: callbackQueryOverrides = {}, ...updateOverrides } = overrides;
   const { message: callbackMessageOverrides = {}, ...callbackQueryRest } = callbackQueryOverrides;
@@ -337,6 +388,27 @@ function getReplyMarkupData(api: ReturnType<typeof setupBot>["api"], callIndex =
 describe("createBot", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+    vi.mocked(getAvailableBackends).mockResolvedValue(["openai"]);
+    vi.mocked(transcribeAudio).mockResolvedValue({
+      text: "transcribed text",
+      backend: "openai",
+      durationMs: 500,
+    });
+    vi.mocked(writeFile).mockResolvedValue(undefined);
+    vi.mocked(unlink).mockResolvedValue(undefined);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(100)),
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("allows authorized users through the middleware and handles /start", async () => {
@@ -743,6 +815,94 @@ describe("createBot", () => {
 
     await bot.handleUpdate(createTestUpdate({ message: { text: "/ignored" } }));
     expect(pi.service.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("transcribes voice messages and feeds the transcript into the prompt flow", async () => {
+    const { bot, pi, api } = setupBot();
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      pi.emitTextDelta("Voice response");
+      pi.emitAgentEnd();
+    });
+
+    await bot.handleUpdate(createVoiceUpdate());
+
+    expect(api.getFile).toHaveBeenCalledWith("voice-file-id");
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      "https://api.telegram.org/file/botbot-token/voice/file.ogg",
+    );
+    expect(transcribeAudio).toHaveBeenCalledTimes(1);
+    expect(pi.service.prompt).toHaveBeenCalledWith("transcribed text");
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("🎤 transcribed text"))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Voice response"))).toBe(true);
+    expect(writeFile).toHaveBeenCalledTimes(1);
+    expect(unlink).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks voice messages while processing and reports transcription failures", async () => {
+    let resolvePrompt!: () => void;
+    const busy = setupBot({
+      piSessionOverrides: {
+        prompt: vi.fn().mockImplementation(
+          () =>
+            new Promise<void>((resolve) => {
+              resolvePrompt = resolve;
+            }),
+        ),
+      },
+    });
+
+    const pending = busy.bot.handleUpdate(createTestUpdate({ message: { text: "first" } }));
+    await nextTick();
+    await busy.bot.handleUpdate(createVoiceUpdate());
+
+    expect(busy.api.sendMessage.mock.calls.at(-1)?.[1]).toContain("Still working on previous message...");
+    expect(transcribeAudio).not.toHaveBeenCalled();
+
+    resolvePrompt();
+    await pending;
+
+    vi.mocked(transcribeAudio).mockRejectedValueOnce(new Error("backend missing"));
+    const failure = setupBot();
+    await failure.bot.handleUpdate(createVoiceUpdate());
+
+    expect(failure.api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Transcription failed:"))).toBe(
+      true,
+    );
+    expect(failure.pi.service.prompt).not.toHaveBeenCalled();
+    expect(unlink).toHaveBeenCalled();
+  });
+
+  it("auto-creates a session for audio files before prompting", async () => {
+    const noSession = setupBot({
+      piSessionOverrides: {
+        hasActiveSession: vi.fn().mockReturnValue(false),
+      },
+    });
+    const promptMock = noSession.pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      noSession.pi.emitTextDelta("Audio response");
+      noSession.pi.emitAgentEnd();
+    });
+
+    await noSession.bot.handleUpdate(
+      createVoiceUpdate({
+        message: {
+          voice: undefined,
+          audio: {
+            file_id: "audio-file-id",
+            file_unique_id: "audio-unique",
+            duration: 6,
+            mime_type: "audio/ogg",
+            file_name: "clip.ogg",
+          },
+        },
+      }),
+    );
+
+    expect(noSession.api.getFile).toHaveBeenCalledWith("audio-file-id");
+    expect(noSession.pi.service.newSession).toHaveBeenCalledTimes(1);
+    expect(noSession.pi.service.prompt).toHaveBeenCalledWith("transcribed text");
   });
 
   it("blocks new messages while processing and auto-creates a session when needed", async () => {
