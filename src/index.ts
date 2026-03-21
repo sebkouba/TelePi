@@ -1,9 +1,16 @@
+import type { UserFromGetMe } from "grammy/types";
+
 import { createBot, registerCommands } from "./bot.js";
 import { loadConfig } from "./config.js";
+import type { PiSessionInfo } from "./pi-session.js";
 import { PiSessionService } from "./pi-session.js";
+
+const STARTUP_CHECK_FLAG = "--check";
+const isStartupCheck = process.argv.includes(STARTUP_CHECK_FLAG);
 
 let piSession: PiSessionService | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
+let hasLoggedStartup = false;
 
 try {
   const config = loadConfig();
@@ -11,11 +18,13 @@ try {
   bot = createBot(config, piSession);
   await registerCommands(bot);
 
-  const sessionInfo = piSession.getInfo();
-  console.log("TelePi running");
-  console.log(`Session ID: ${sessionInfo.sessionId}`);
-  console.log(`Session file: ${sessionInfo.sessionFile ?? "(in-memory)"}`);
-  console.log(`Workspace: ${sessionInfo.workspace}`);
+  if (isStartupCheck) {
+    const botInfo = await bot.api.getMe();
+    console.log(`TelePi startup check passed (${formatBotIdentity(botInfo)})`);
+    logSessionInfo(piSession.getInfo());
+    piSession.dispose();
+    process.exit(0);
+  }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Failed to start TelePi: ${message}`);
@@ -56,6 +65,11 @@ async function startPolling(): Promise<void> {
       drop_pending_updates: true,
       onStart: () => {
         restartAttempts = 0;
+        if (!hasLoggedStartup && piSession) {
+          hasLoggedStartup = true;
+          console.log("TelePi running");
+          logSessionInfo(piSession.getInfo());
+        }
       },
     });
   } catch (error) {
@@ -76,6 +90,20 @@ async function startPolling(): Promise<void> {
     piSession?.dispose();
     process.exit(1);
   }
+}
+
+function logSessionInfo(sessionInfo: PiSessionInfo): void {
+  console.log(`Session ID: ${sessionInfo.sessionId}`);
+  console.log(`Session file: ${sessionInfo.sessionFile ?? "(in-memory)"}`);
+  console.log(`Workspace: ${sessionInfo.workspace}`);
+}
+
+function formatBotIdentity(botInfo: UserFromGetMe): string {
+  if (botInfo.username) {
+    return `@${botInfo.username}`;
+  }
+
+  return botInfo.first_name || `bot ${botInfo.id}`;
 }
 
 await startPolling();

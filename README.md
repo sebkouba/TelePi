@@ -33,7 +33,12 @@ TelePi is a Telegram bridge for the [Pi coding agent](https://github.com/badlogi
    - `PI_SESSION_PATH` *(optional)* — open a specific Pi session JSONL file for hand-off
    - `PI_MODEL` *(optional)* — force a specific model, e.g. `anthropic/claude-sonnet-4-5`
 
-3. Start the bot:
+3. Validate the setup without starting long polling:
+   ```bash
+   npm run check
+   ```
+
+4. Start the bot when you're ready:
    ```bash
    npm run dev
    ```
@@ -60,7 +65,7 @@ TelePi supports seamless bi-directional session hand-off between Pi CLI and Tele
 You're working in Pi CLI on your laptop and want to continue from your phone:
 
 1. **In Pi CLI**, type `/handoff`
-2. The extension kills any running TelePi instance, launches TelePi with your current session, and shuts down Pi CLI
+2. The extension replaces the existing TelePi tmux session, launches TelePi with your current session, waits for a successful startup log, and only then shuts down Pi CLI
 3. **Open Telegram** — TelePi is already running with your full conversation context. Just keep typing.
 
 **Extension installation** — symlink into Pi's global extensions directory:
@@ -104,7 +109,7 @@ Without the extension, you can hand off manually:
 
 1. Note the session file path from Pi CLI (shown on startup)
 2. Set `PI_SESSION_PATH` in TelePi's `.env`
-3. Start TelePi: `npm run dev`
+3. Validate config with `npm run check`, then start TelePi with `npm run dev`
 
 ### How it works
 
@@ -192,6 +197,7 @@ Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
 ```bash
 npm install
 npm run build          # TypeScript compilation
+npm run check          # Validate config + bot token, then exit
 npm run dev            # Run with tsx (auto-loads .env)
 npm test               # Run tests
 npm run test:coverage  # Run tests with coverage report
