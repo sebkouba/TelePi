@@ -32,6 +32,8 @@ TelePi is a Telegram bridge for the [Pi coding agent](https://github.com/badlogi
    - `TELEGRAM_ALLOWED_USER_IDS` — your Telegram numeric user ID (comma-separated for multiple)
    - `PI_SESSION_PATH` *(optional)* — open a specific Pi session JSONL file for hand-off
    - `PI_MODEL` *(optional)* — force a specific model, e.g. `anthropic/claude-sonnet-4-5`
+   - `ROBIN_CWD` *(optional)* — workspace path for the `/robin` shortcut
+   - `SCHMIDT_CWD` *(optional)* — workspace path for the `/schmidt` shortcut
 
 3. Validate the setup without starting long polling:
    ```bash
@@ -49,6 +51,8 @@ TelePi is a Telegram bridge for the [Pi coding agent](https://github.com/badlogi
 |---------|-------------|
 | `/start` | Welcome message and current session info |
 | `/new` | Create a fresh session (shows workspace picker if multiple known) |
+| `/robin` | Jump to the latest session in `ROBIN_CWD` or start a new one |
+| `/schmidt` | Jump to the latest session in `SCHMIDT_CWD` or start a new one |
 | `/handback` | Hand session back to Pi CLI (copies resume command to clipboard) |
 | `/abort` | Cancel the current Pi operation |
 | `/session` | Show current session details (ID, file, workspace, model) |

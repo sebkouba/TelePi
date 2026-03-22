@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -24,6 +25,10 @@ const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
+const NAMED_WORKSPACE_ENVS = {
+  robin: "ROBIN_CWD",
+  schmidt: "SCHMIDT_CWD",
+} as const;
 
 type TelegramChatId = number | string;
 type TelegramParseMode = "HTML";
@@ -50,6 +55,8 @@ type RenderedText = {
 type RenderedChunk = RenderedText & {
   sourceText: string;
 };
+
+type NamedWorkspaceCommand = keyof typeof NAMED_WORKSPACE_ENVS;
 
 export function createBot(config: TelePiConfig, piSession: PiSessionService): Bot<Context> {
   const bot = new Bot<Context>(config.telegramBotToken);
@@ -116,6 +123,90 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
         fallbackText: `Failed to create session: ${formatError(error)}`,
       });
       return false;
+    }
+  };
+
+  const switchToNamedWorkspace = async (
+    ctx: Context,
+    commandName: NamedWorkspaceCommand,
+  ): Promise<void> => {
+    const workspace = getNamedWorkspace(commandName);
+    const label = formatNamedWorkspaceLabel(commandName);
+    const envVar = NAMED_WORKSPACE_ENVS[commandName];
+
+    if (isBusy()) {
+      await safeReply(ctx, escapeHTML(`Cannot switch to ${label} while a prompt is running.`), {
+        fallbackText: `Cannot switch to ${label} while a prompt is running.`,
+      });
+      return;
+    }
+
+    if (!workspace) {
+      await safeReply(
+        ctx,
+        escapeHTML(`${label} workspace is not configured. Set ${envVar} in .env.`),
+        {
+          fallbackText: `${label} workspace is not configured. Set ${envVar} in .env.`,
+        },
+      );
+      return;
+    }
+
+    if (!existsSync(workspace)) {
+      await safeReply(
+        ctx,
+        escapeHTML(`${label} workspace does not exist: ${workspace}`),
+        {
+          fallbackText: `${label} workspace does not exist: ${workspace}`,
+        },
+      );
+      return;
+    }
+
+    isSwitching = true;
+    try {
+      if (piSession.hasActiveSession() && piSession.getCurrentWorkspace() === workspace) {
+        const info = piSession.getInfo();
+        await safeReply(ctx, `<b>${escapeHTML(label)}</b> is already active.\n\n${renderSessionInfoHTML(info)}`, {
+          fallbackText: `${label} is already active.\n\n${renderSessionInfoPlain(info)}`,
+        });
+        return;
+      }
+
+      const latestSession = (await piSession.listAllSessions()).find((session) => session.cwd === workspace);
+      if (latestSession) {
+        const info = await piSession.switchSession(latestSession.path, workspace);
+        await safeReply(
+          ctx,
+          `<b>Switched to latest ${escapeHTML(label)} session.</b>\n\n${renderSessionInfoHTML(info)}`,
+          {
+            fallbackText: `Switched to latest ${label} session.\n\n${renderSessionInfoPlain(info)}`,
+          },
+        );
+        return;
+      }
+
+      const { info, created } = await piSession.newSession(workspace);
+      if (!created) {
+        await safeReply(ctx, escapeHTML(`New ${label} session was cancelled.`), {
+          fallbackText: `New ${label} session was cancelled.`,
+        });
+        return;
+      }
+
+      await safeReply(
+        ctx,
+        `<b>Started new ${escapeHTML(label)} session.</b>\n\n${renderSessionInfoHTML(info)}`,
+        {
+          fallbackText: `Started new ${label} session.\n\n${renderSessionInfoPlain(info)}`,
+        },
+      );
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(formatError(error))}`, {
+        fallbackText: `Failed: ${formatError(error)}`,
+      });
+    } finally {
+      isSwitching = false;
     }
   };
 
@@ -684,6 +775,14 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       fallbackText: "Select workspace for new session:",
       replyMarkup: keyboard,
     });
+  });
+
+  bot.command("robin", async (ctx) => {
+    await switchToNamedWorkspace(ctx, "robin");
+  });
+
+  bot.command("schmidt", async (ctx) => {
+    await switchToNamedWorkspace(ctx, "schmidt");
   });
 
   bot.command("handback", async (ctx) => {
@@ -1469,6 +1568,8 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
   await bot.api.setMyCommands([
     { command: "start", description: "Welcome and session info" },
     { command: "new", description: "Start a new session" },
+    { command: "robin", description: "Switch to the Robin workspace" },
+    { command: "schmidt", description: "Switch to the Schmidt workspace" },
     { command: "handback", description: "Hand session back to Pi CLI" },
     { command: "abort", description: "Cancel current operation" },
     { command: "session", description: "Current session details" },
@@ -1818,6 +1919,16 @@ function stripHtml(text: string): string {
 
 function getWorkspaceShortName(workspace: string): string {
   return workspace.split(/[\\/]/).filter(Boolean).pop() ?? workspace;
+}
+
+function getNamedWorkspace(commandName: NamedWorkspaceCommand): string | undefined {
+  const envVar = NAMED_WORKSPACE_ENVS[commandName];
+  const workspace = process.env[envVar]?.trim();
+  return workspace ? workspace : undefined;
+}
+
+function formatNamedWorkspaceLabel(commandName: NamedWorkspaceCommand): string {
+  return commandName.charAt(0).toUpperCase() + commandName.slice(1);
 }
 
 function isMessageNotModifiedError(error: unknown): boolean {

@@ -1,4 +1,7 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import { unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { vi } from "vitest";
 
 vi.mock("@grammyjs/auto-retry", () => ({
@@ -385,6 +388,10 @@ function getReplyMarkupData(api: ReturnType<typeof setupBot>["api"], callIndex =
   return markup?.inline_keyboard?.flat().map((button: any) => button.callback_data) ?? [];
 }
 
+function createWorkspaceDir(name: string): string {
+  return mkdtempSync(path.join(tmpdir(), `telepi-${name}-`));
+}
+
 describe("createBot", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -408,6 +415,8 @@ describe("createBot", () => {
   });
 
   afterEach(() => {
+    delete process.env.ROBIN_CWD;
+    delete process.env.SCHMIDT_CWD;
     vi.unstubAllGlobals();
   });
 
@@ -579,6 +588,75 @@ describe("createBot", () => {
     expect(api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", { text: "Creating session..." });
     expect(pi.service.newSession).toHaveBeenCalledWith("/workspace/B");
     expect(api.editMessageText).toHaveBeenCalled();
+  });
+
+  it("handles /robin and /schmidt workspace shortcuts", async () => {
+    const robinDir = createWorkspaceDir("robin");
+    const schmidtDir = createWorkspaceDir("schmidt");
+
+    try {
+      process.env.ROBIN_CWD = robinDir;
+      process.env.SCHMIDT_CWD = schmidtDir;
+
+      const robin = setupBot({
+        piSessionOverrides: {
+          listAllSessions: vi.fn().mockResolvedValue([
+            {
+              id: "robin-1",
+              firstMessage: "Latest Robin",
+              path: "/robin.jsonl",
+              messageCount: 7,
+              cwd: robinDir,
+              modified: new Date("2025-01-03T00:00:00.000Z"),
+              name: undefined,
+            },
+          ]),
+          switchSession: vi.fn().mockResolvedValue({
+            sessionId: "robin-id",
+            sessionFile: "/robin.jsonl",
+            workspace: robinDir,
+            model: "openai-codex/gpt-5.4",
+          }),
+        },
+      });
+      await robin.bot.handleUpdate(createTestUpdate({ message: { text: "/robin" } }));
+      expect(robin.pi.service.switchSession).toHaveBeenCalledWith("/robin.jsonl", robinDir);
+      expect(robin.api.sendMessage.mock.calls[0]?.[1]).toContain("Switched to latest Robin session.");
+
+      const schmidt = setupBot({
+        piSessionOverrides: {
+          listAllSessions: vi.fn().mockResolvedValue([]),
+          newSession: vi.fn().mockResolvedValue({
+            created: true,
+            info: {
+              sessionId: "schmidt-id",
+              sessionFile: "/schmidt.jsonl",
+              workspace: schmidtDir,
+              model: "openai-codex/gpt-5.4",
+            },
+          }),
+        },
+      });
+      await schmidt.bot.handleUpdate(createTestUpdate({ message: { text: "/schmidt" } }));
+      expect(schmidt.pi.service.newSession).toHaveBeenCalledWith(schmidtDir);
+      expect(schmidt.api.sendMessage.mock.calls[0]?.[1]).toContain("Started new Schmidt session.");
+    } finally {
+      rmSync(robinDir, { recursive: true, force: true });
+      rmSync(schmidtDir, { recursive: true, force: true });
+    }
+  });
+
+  it("validates named workspace shortcut configuration", async () => {
+    const missing = setupBot();
+    await missing.bot.handleUpdate(createTestUpdate({ message: { text: "/robin" } }));
+    expect(missing.api.sendMessage.mock.calls[0]?.[1]).toContain(
+      "Robin workspace is not configured. Set ROBIN_CWD in .env.",
+    );
+
+    process.env.SCHMIDT_CWD = path.join(tmpdir(), "telepi-missing-schmidt");
+    const invalid = setupBot();
+    await invalid.bot.handleUpdate(createTestUpdate({ message: { text: "/schmidt" } }));
+    expect(invalid.api.sendMessage.mock.calls[0]?.[1]).toContain("Schmidt workspace does not exist:");
   });
 
   it("handles /handback and blocks it when unavailable or busy", async () => {
@@ -1210,6 +1288,8 @@ describe("createBot", () => {
     expect(api.setMyCommands).toHaveBeenCalledWith([
       { command: "start", description: "Welcome and session info" },
       { command: "new", description: "Start a new session" },
+      { command: "robin", description: "Switch to the Robin workspace" },
+      { command: "schmidt", description: "Switch to the Schmidt workspace" },
       { command: "handback", description: "Hand session back to Pi CLI" },
       { command: "abort", description: "Cancel current operation" },
       { command: "session", description: "Current session details" },
